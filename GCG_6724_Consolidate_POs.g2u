@@ -1,0 +1,293 @@
+﻿Program.Sub.Preflight.Start
+V.Global.bConOpen.Declare(Boolean, False)
+V.Global.sPO.Declare
+V.Global.sTerminalNo.Declare
+V.Global.sRPTID.Declare
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+'Project 6724: PO Form Order Line Consolidation 
+'Brandon Medina 
+'Customer: IMG Companies LLC 
+'Quote: 13416
+'Description: This project consolidates repeated PO lines by grouping repeated parts on the core PO report together from the BI table PRT_LASER_PO and JOB_SERIAL.
+'Modifies description of the line to contain a comma delimited list of all the serial numbers 
+F.Intrinsic.Control.Try
+	V.Local.sSQL.Declare
+	
+	F.Global.BI.GetIDFromName("Purchase Order for Outside - List SNs & WOs", V.Global.sRPTID)
+	F.Intrinsic.Control.If(V.Caller.Hook, <>, 16090, OR, V.Passed.CALLING-PGM, <>, "PUR1LZBI")
+	F.Intrinsic.Control.AndIf(V.Passed.BIP_REPORTID, <>, V.Global.sRPTID)
+		F.Intrinsic.Control.End
+	F.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.Control.CallSub(check_table)
+	'Not needed, done by first check 
+	'F.Intrinsic.Control.CallSub(check_vendor_report)
+	
+	'Set Global Variable for PO number being printed (PO is not in the list of passed variables for this process, but Terminal No is, which from what I can see, corresponds 1-1 for a PO 
+	'i.e. each unique Terminal No only has 1 given PO in the PRT_LASER_PO table
+	V.Global.sTerminalNo.Set(V.Passed.BIP_Terminal.Trim)
+	'V.Global.sRPTID.Set(V.Passed.BIP_REPORTID.Trim)
+	F.Intrinsic.String.Build("select top 1 (PO_NO) from V_PRT_LASER_PO where TERMINAL_NO = '{0}'", V.Global.sTerminalNo, V.Local.sSQL)
+	F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Global.sPO)
+	
+	F.Intrinsic.Control.CallSub(consolidate_work_orders)
+	
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(ErrorMsg, CurrentSub, V.Ambient.CurrentSubroutine)
+F.Intrinsic.Control.EndTry
+Program.Sub.Main.End
+
+Program.Sub.ErrorMsg.Start
+'Generic Error message.
+V.Local.sError.Declare
+
+F.Intrinsic.Control.If(V.Global.bConOpen)
+	F.ODBC.Connection!con.Close
+F.Intrinsic.Control.EndIf
+
+f.Intrinsic.String.Build("Project GCG_6724_Consolidate_POs.g2u {0}{0}Subroutine: {1}{0}Error: {2} with Description: {3}", v.Ambient.NewLine, v.Args.CurrentSub, v.Ambient.ErrorNumber, v.Ambient.ErrorDescription, v.Local.sError)
+f.Intrinsic.UI.Msgbox(v.Local.sError)
+Program.Sub.ErrorMsg.End
+
+Program.Sub.check_table.Start
+F.Intrinsic.Control.Try
+	V.Local.bExists.Declare
+	V.Local.sSQL.Declare
+	
+	F.ODBC.Connection!con.OpenCompanyConnection
+	V.Global.bConOpen.Set(True)
+	F.ODBC.Connection!con.TableExists("GCG_6724_PO_EXT_DESC", V.Local.bExists)
+	
+	F.Intrinsic.Control.If(V.Local.bExists.Not)
+		V.Local.sSQL.Set("create table GCG_6724_PO_EXT_DESC (PO_NO CHAR(7), PART CHAR(20), DESCRIPTION VARCHAR(325), SERIALS VARCHAR(325))")
+		F.ODBC.Connection!con.Execute(V.Local.sSQL)
+	F.Intrinsic.Control.EndIf
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(ErrorMsg, CurrentSub, V.Ambient.CurrentSubroutine)
+F.Intrinsic.Control.EndTry
+Program.Sub.check_table.End
+
+Program.Sub.check_vendor_report.Start
+F.Intrinsic.Control.Try
+	V.Local.sSQL.Declare
+	V.Local.sPO.Declare
+	V.Local.sBIRptID.Declare
+	'Query Vendor Addl to check for custom PO report, passing to it the vendor in BI data table (PRT_PRINT_PO)
+	'TODO: Figure out name of passed variable to fill in the PO attempting to be printed from hook 16090
+	F.Intrinsic.String.Build("select BI_PO_RPT_ID from V_VENDOR_ADDL where VENDOR in (select top 1 VENDOR from V_PRT_LASER_PO where PO_NO = '{0}')", V.Global.sPO, V.Local.sSQL)
+	F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sBIRptID)
+	F.Intrinsic.Control.If(V.Local.sBIRptID.Trim, <>, V.Passed.BIP_REPORTID.Trim)
+		F.Intrinsic.Control.End
+	F.Intrinsic.Control.EndIf
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(ErrorMsg, CurrentSub, V.Ambient.CurrentSubroutine)
+F.Intrinsic.Control.EndTry
+Program.Sub.check_table.End
+Program.Sub.check_vendor_report.End
+
+Program.Sub.consolidate_work_orders.Start
+F.Intrinsic.Control.Try
+'Subroutine will group work orders by part numbers (customer has a 1-1 relationship between parts and WOs), and create a comma delimited list to output to GCG_6724.DESCRIPTION
+	V.Local.sPO.Declare
+	V.Local.sSQL.Declare
+	V.Local.sUniqueArrayTemp.Declare
+	V.Local.sUniquePartsArray.Declare
+	V.Local.sUniqueParts.Declare
+	V.Local.iRow.Declare
+	V.Local.iPrevRow.Declare
+	V.Local.bIsInDict.Declare
+	V.Local.i.Declare
+	V.Local.sNewPriceSum.Declare
+	V.Local.sNewTotalSum.Declare
+	V.Local.sExtTotal.Declare
+	V.Local.sWOList.Declare
+	V.Local.sNewLineExt.Declare
+	V.Local.sSNList.Declare
+	V.Local.sTemp.Declare
+	V.Local.sPartOnLine.Declare
+	
+	'TODO: FIGURE OUT NAME OF PASSED VARIABLE CONTAINING PO NUMBER 
+	
+	'Create list of unique parts on PO. Exclude * since those can appear (core uses this to exclude part from affecting supply and demand)
+'	F.Intrinsic.String.Build("select distinct PART from V_PRT_LASER_PO where PO_NO = '{0}' and PART <> '' and PART not like '%*%'", V.Local.sPO, V.Local.sSQL)
+'	F.ODBC.Connection!con.ExecuteAndReturn(V.Local.sSQL, V.Local.sUniqueParts)
+	
+	'Create table w info needed (or close to it, there will be repeated lines due to how PRT_LASER_PO table is laid out)
+	'F.Intrinsic.String.Build("select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, PART, DESCRIPTION, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 17), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '{0}' and PART not like '%*%' and TERMINAL_NO = '{1}' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00')", V.Local.sPO, V.Passed.BIP_Terminal, V.Local.sSQL)
+	'F.Intrinsic.String.Build("select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, PART, DESCRIPTION, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 6), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '{0}' and PART not like '%*%' and TERMINAL_NO = '{1}' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00')", "0000217", "138", V.Local.sSQL)
+	'select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, ltrim(rtrim(PART)) as PART, DESCRIPTION, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 6), '') as WO_MATCH, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 17), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '0000217' and PART not like '%*%' and TERMINAL_NO = '138' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00')
+	'F.Intrinsic.String.Build("select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, ltrim(rtrim(PART)) as PART, DESCRIPTION, COMMENTS, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 6), '') as WO_MATCH, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 17), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '{0}' and PART not like '%*%' and TERMINAL_NO = '{1}' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00' or COMMENTS <> '')", "0122329", "065", V.Local.sSQL)
+	'F.Intrinsic.String.Build("select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, ltrim(rtrim(PART)) as PART, DESCRIPTION, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 6), '') as WO_MATCH, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 17), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '{0}' and PART not like '%*%' and TERMINAL_NO = '{1}' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00')", "0122329", "065", V.Local.sSQL)
+	F.Intrinsic.String.Build("select TERMINAL_NO, RPTID, PO_NO, VENDOR, VENDOR_NAME, ltrim(rtrim(PART)) as PART, DESCRIPTION, PRICE_2, QTY_ORD, QTY_ORD_DEC, NET_AMT, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 6), '') as WO_MATCH, IF(LEFT(DESCRIPTION, 4) = 'WO: ', SUBSTRING(DESCRIPTION, 5, 17), '') as WO_NO from V_PRT_LASER_PO where PO_NO = '{0}' and PART not like '%*%' and TERMINAL_NO = '{1}' and (DESCRIPTION like 'WO:%' or PRICE_2 <> '0.00')", V.Global.sPO, V.Global.sTerminalNo, V.Local.sSQL)
+	F.Data.DataTable.CreateFromSQL("dtWorkingTable", "con", V.Local.sSQL)
+
+	'Add in SN to rows with WO numbers 
+	F.Data.DataTable.AddColumn("dtWorkingTable", "SERIAL_NUMS", "String")
+	'Account for situation where there is a range of serial numbers for a given WO
+	'V.Local.sSQL.Set("select ltrim(rtrim(JOB)) as JOB_MATCH, SERIAL_START from V_JOB_SERIAL")
+	V.Local.sSQL.Set("select ltrim(rtrim(JOB)) as JOB_MATCH, IF(min(SERIAL_START) = max(SERIAL_END), ltrim(rtrim(min(SERIAL_START))), ltrim(rtrim(min(SERIAL_START))) + ' - ' + ltrim(rtrim(max(SERIAL_END)))) as SERIAL from V_JOB_SERIAL group by JOB")
+	F.Data.Dictionary.CreateFromSQL("dictSerialNums", "con", V.Local.sSQL)
+	F.Data.Dictionary.SetDefaultReturn("dictSerialNums", "")
+	F.Data.DataTable.FillFromDictionary("dtWorkingTable", "dictSerialNums", "WO_MATCH", "SERIAL_NUMS")
+	F.Data.Dictionary.Close("dictSerialNums")
+	
+	'Create list of unique parts on PO. Exclude * since those can appear (core uses this to exclude part from affecting supply and demand)
+	F.Data.DataTable.ColumnToString("dtWorkingTable", "PART", V.Local.sUniquePartsArray)
+	F.Intrinsic.String.Split(V.Local.sUniquePartsArray, "*!*", V.Local.sUniquePartsArray)
+	F.Intrinsic.String.RemoveArrayDuplicates(V.Local.sUniquePartsArray, V.Local.sUniquePartsArray)
+		
+	F.Intrinsic.Control.For(V.Local.i, 0, V.Local.sUniquePartsArray.UBound, 1)
+		F.Intrinsic.Control.If(V.Local.sUniquePartsArray(V.Local.i).Trim, =, "")
+			'V.Local.sUniquePartsArray(V.Local.i).Set(V.Local.sUniqueArrayTemp(V.Local.i))
+			F.Intrinsic.Variable.RemoveArrayElementByOrdinal(V.Local.sUniquePartsArray, V.Local.i, V.Local.sUniquePartsArray)
+		F.Intrinsic.Control.EndIf
+	F.Intrinsic.Control.Next(V.Local.i)
+	F.Intrinsic.String.Join(V.Local.sUniquePartsArray, "*!*", V.Local.sUniqueParts)
+
+	
+	'Create 5 Dictionaries to keep track of properties for each unique part w the part name serving as the keys
+	F.Data.Dictionary.Create("dictUnitPrices")
+	F.Data.Dictionary.Create("dictQty")
+	F.Data.Dictionary.Create("dictExtPrice")
+	F.Data.Dictionary.Create("dictWOs")
+	F.Data.Dictionary.Create("dictSNs")
+	'F.Data.Dictionary.Create("dictComments")
+	F.Intrinsic.Control.For(V.Local.i, 0, V.Local.sUniquePartsArray.UBound, 1)
+		F.Data.Dictionary.AddItem("dictUnitPrices", V.Local.sUniquePartsArray(V.Local.i), "0")
+		F.Data.Dictionary.AddItem("dictQty", V.Local.sUniquePartsArray(V.Local.i), "0")
+		F.Data.Dictionary.AddItem("dictExtPrice", V.Local.sUniquePartsArray(V.Local.i), "0")
+		F.Data.Dictionary.AddItem("dictWOs", V.Local.sUniquePartsArray(V.Local.i), "")
+		F.Data.Dictionary.AddItem("dictSNs", V.Local.sUniquePartsArray(V.Local.i), "")
+		'F.Data.Dictionary.AddItem("dictComments", V.Local.sUniquePartsArray(V.Local.i), "")
+	F.Intrinsic.Control.Next(V.Local.i)
+
+	'Total up qty of each Part. Store in dictionary for total and ext total 
+	F.Intrinsic.Control.For(V.Local.iRow, 0, V.DataTable.dtWorkingTable.RowCount--, 1)
+		'Add total to value in dictionary and update. Skip over blank parts to prevent dictionary key error 
+		F.Intrinsic.Control.If(V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim, <>, "")
+			'Set part that is being worked on 
+			V.Local.sPartOnLine.Set(V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim)
+			'Using that, multipy it out by unit price, update that dictionary
+			'F.Intrinsic.Math.Mult(V.Dictionary.dictQty![V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim], V.DataTable.dtWorkingTable(V.Local.iRow).PRICE_2!FieldVal, V.Local.sNewLineExt)
+			F.Intrinsic.Math.Mult(V.DataTable.dtWorkingTable(V.Local.iRow).QTY_ORD_DEC!FieldVal, V.DataTable.dtWorkingTable(V.Local.iRow).PRICE_2!FieldVal, V.Local.sNewLineExt)
+			'F.Intrinsic.Control.EndIf
+			'F.Intrinsic.Math.Add(V.Dictionary.dictUnitPrices![V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldVal], V.DataTable.dtWorkingTable(V.Local.iRow).PRICE_2!FieldVal, V.Local.sNewPriceSum)
+			'F.Data.Dictionary.UpdateItem("dictUnitPrices", V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldVal, V.Local.sNewPriceSum)
+			F.Intrinsic.Math.Add(V.Dictionary.dictExtPrice![V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim], V.Local.sNewLineExt, V.Local.sNewPriceSum)
+			F.Data.Dictionary.UpdateItem("dictExtPrice", V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim, V.Local.sNewPriceSum)
+			
+			'Update Qty
+			F.Intrinsic.Math.Add(V.Dictionary.dictQty![V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim], V.DataTable.dtWorkingTable(V.Local.iRow).QTY_ORD_DEC!FieldVal, V.Local.sNewTotalSum)
+			F.Data.Dictionary.UpdateItem("dictQty", V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim, V.Local.sNewTotalSum)
+			
+			'Same w the Unit Price. Most the time this will be redundant. Only update if the current row has a part on it
+			F.Intrinsic.Control.If(V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim, <>, "")
+				F.Data.Dictionary.UpdateItem("dictUnitPrices", V.DataTable.dtWorkingTable(V.Local.iRow).PART!FieldValTrim, V.DataTable.dtWorkingTable(V.Local.iRow).PRICE_2!FieldVal)
+			F.Intrinsic.Control.EndIf
+		F.Intrinsic.Control.EndIf
+		
+		'Used to grab previous row. Used for grabbing the part name on rows w WOs (their part field is blank). Same with Comments 
+'		F.Intrinsic.Math.Sub(V.Local.iRow, 1, V.Local.iPrevRow)
+'		F.Intrinsic.Control.If()
+'		
+'		F.Intrinsic.Control.EndIf
+			
+		'See if line has a comment on it and save to dictionary. If a given part already has a comment in the dictionary, skip over, as each part should only have one comment 
+'		F.Intrinsic.Control.If(V.DataTable.dtWorkingTable(V.Local.iRow).COMMENTS!FieldValTrim, <>, "")
+'			'F.Intrinsic.Control.If(V.Dictionary.dictComments![V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim], =, "")
+'			F.Data.Dictionary.UpdateItem("dictComments", V.Local.sPartOnLine, V.DataTable.dtWorkingTable(V.Local.iRow).COMMENTS!FieldValTrim)
+'			'F.Intrinsic.Control.EndIf
+'		F.Intrinsic.Control.EndIf
+		
+		'Build up WO and SN list 
+		F.Intrinsic.Control.If(V.DataTable.dtWorkingTable(V.Local.iRow).WO_NO!FieldValTrim, <>, "")
+			'F.Intrinsic.Control.If(V.Local.sWOList(0), =, "")
+			'Function.Intrinsic.Debug.Stop
+			
+			'V.Local.sTemp.Set(V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim)
+			'F.Intrinsic.Control.If(V.Dictionary.dictWOs![V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim], =, "")
+			F.Intrinsic.Control.If(V.Dictionary.dictWOs![V.Local.sPartOnLine], =, "")
+				F.Intrinsic.String.Build("WO: {0}", V.DataTable.dtWorkingTable(V.Local.iRow).WO_NO!FieldValTrim, V.Local.sWOList)
+				'F.Data.Dictionary.UpdateItem("dictWOs", V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim, V.Local.sWOList)
+				F.Data.Dictionary.UpdateItem("dictWOs", V.Local.sPartOnLine, V.Local.sWOList)
+			F.Intrinsic.Control.Else
+				'F.Intrinsic.Variable.AddToArray(V.Local.sWOList, V.DataTable.dtWorkingTable(V.Local.iRow).WO_MATCH!FieldValTrim)
+				'F.Intrinsic.String.Build("{0},{1}", V.Dictionary.dictWOs![V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim], V.DataTable.dtWorkingTable(V.Local.iRow).WO_NO!FieldValTrim, V.Local.sWOList)
+				F.Intrinsic.String.Build("{0},{1}", V.Dictionary.dictWOs![V.Local.sPartOnLine], V.DataTable.dtWorkingTable(V.Local.iRow).WO_NO!FieldValTrim, V.Local.sWOList)
+				'F.Data.Dictionary.UpdateItem("dictWOs", V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim, V.Local.sWOList)
+				F.Data.Dictionary.UpdateItem("dictWOs", V.Local.sPartOnLine, V.Local.sWOList)
+			F.Intrinsic.Control.EndIf
+			
+			'F.Intrinsic.Control.If(V.Local.sSNList(0), =, "")
+			'F.Intrinsic.Control.If(V.Dictionary.dictSNs![V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim], =, "")
+			F.Intrinsic.Control.If(V.Dictionary.dictSNs![V.Local.sPartOnLine], =, "")
+				F.Intrinsic.String.Build("SN: {0}", V.DataTable.dtWorkingTable(V.Local.iRow).SERIAL_NUMS!FieldValTrim, V.Local.sSNList)
+				'F.Data.Dictionary.UpdateItem("dictSNs", V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim, V.Local.sSNList)
+				F.Data.Dictionary.UpdateItem("dictSNs", V.Local.sPartOnLine, V.Local.sSNList)
+			F.Intrinsic.Control.Else
+				'F.Intrinsic.Variable.AddToArray(V.Local.sSNList, V.DataTable.dtWorkingTable(V.Local.iRow).SERIAL_NUMS!FieldValTrim)
+				'F.Intrinsic.String.Build("{0},{1}", V.Dictionary.dictSNs![V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim], V.DataTable.dtWorkingTable(V.Local.iRow).SERIAL_NUMS!FieldValTrim, V.Local.sSNList)
+				F.Intrinsic.String.Build("{0},{1}", V.Dictionary.dictSNs![V.Local.sPartOnLine], V.DataTable.dtWorkingTable(V.Local.iRow).SERIAL_NUMS!FieldValTrim, V.Local.sSNList)
+				'F.Data.Dictionary.UpdateItem("dictSNs", V.DataTable.dtWorkingTable(V.Local.iPrevRow).PART!FieldValTrim, V.Local.sSNList)
+				F.Data.Dictionary.UpdateItem("dictSNs", V.Local.sPartOnLine, V.Local.sSNList)
+			F.Intrinsic.Control.EndIf
+		F.Intrinsic.Control.EndIf
+	F.Intrinsic.Control.Next(V.Local.iRow)	
+	
+
+	'Get only unique rows in working table now that we have all info stored in dictionaries and arrays. Fill that data into the table
+	F.Data.DataView.Create("dtWorkingTable", "dvUnique", 22, "PART <> ''", "")
+	F.Data.DataView.ToDataTableDistinct("dtWorkingTable", "dvUnique", "dtUnique", "TERMINAL_NO*!*RPTID*!*PO_NO*!*VENDOR*!*VENDOR_NAME*!*PART*!*DESCRIPTION*!*COMMENTS*!*PRICE_2*!*QTY_ORD*!*QTY_ORD_DEC*!*NET_AMT*!*WO_NO*!*SERIAL_NUMS")
+	F.Data.Dictionary.SetDefaultReturn("dictSNs", "")
+	F.Data.Dictionary.SetDefaultReturn("dictWOs", "")
+	F.Data.Dictionary.SetDefaultReturn("dictQty", "")
+	F.Data.Dictionary.SetDefaultReturn("dictUnitPrices", "")
+	F.Data.Dictionary.SetDefaultReturn("dictExtPrice", "")
+'	F.Data.Dictionary.SetDefaultReturn("dictComments", "")
+	
+	F.Data.Datatable.FillFromDictionary("dtUnique", "dictSNs", "PART", "SERIAL_NUMS")
+	F.Data.Datatable.FillFromDictionary("dtUnique", "dictWOs", "PART", "WO_NO")
+	F.Data.Datatable.FillFromDictionary("dtUnique", "dictQty", "PART", "QTY_ORD_DEC")
+	F.Data.Datatable.FillFromDictionary("dtUnique", "dictUnitPrices", "PART", "PRICE_2")
+	F.Data.Datatable.FillFromDictionary("dtUnique", "dictExtPrice", "PART", "NET_AMT")
+'	F.Data.DataTable.FillFromDictionary("dtUnique", "dictComments", "PART", "COMMENTS")
+	
+	F.Data.Dictionary.Close("dictSNs")
+	F.Data.Dictionary.Close("dictWOs")
+	F.Data.Dictionary.Close("dictQty")
+	F.Data.Dictionary.Close("dictUnitPrices")
+	F.Data.Dictionary.Close("dictExtPrice")
+'	F.Data.Dictionary.Close("dictComments")
+	
+	'Set DESCRIPTION in dt to "Modified by 6724" to use as criteria to delete the other records in BI table (aside from first instance)
+	F.Data.DataTable.SetValue("dtUnique", -1, "DESCRIPTION", "Modified by 6724")
+	
+	Function.Intrinsic.Debug.InvokeDebugger
+	Function.Intrinsic.Debug.Stop
+	'Save Descriptions (WO & SN lists) to Custom Table 
+	F.Data.Datatable.SaveToDB("dtUnique", "con", "GCG_6724_PO_EXT_DESC", "PO_NO*!*PART", 256, "PO_NO@!@PO_NO*!*PART@!@PART*!*WO_NO@!@DESCRIPTION*!*SERIAL_NUMS@!@SERIALS")
+	'Save new qtys to core table report mostly reads from. Seems to only modify the first instance. 
+	F.Data.Datatable.SaveToDB("dtUnique", "con", "PRT_LASER_PO", "TERMINAL_NO*!*PO_NO*!*PART", 256, "TERMINAL_NO@!@TERMINAL_NO*!*PO_NO@!@PO_NO*!*PART@!@PART*!*PRICE_2@!@PRICE_2*!*QTY_ORD_DEC@!@QTY_ORD_DEC*!*NET_AMT@!@NET_AMT*!*DESCRIPTION@!@DESCRIPTION")
+	
+	'Delete the other repeats for each part 
+	'F.Intrinsic.String.Build("delete from PRT_LASER_PO where PO_NO = '{0}' and DESCRIPTION <> 'Modified by 6724' and TERMINAL_NO = '{1}' and RPTID = '{2}'", "0122329", "065", "100002", V.Local.sSQL)
+	F.Intrinsic.String.Build("delete from PRT_LASER_PO where PO_NO = '{0}' and DESCRIPTION <> 'Modified by 6724' and TERMINAL_NO = '{1}' and RPTID = '{2}'", V.Global.sPO, V.Global.sTerminalNo, V.Global.sRPTID, V.Local.sSQL)
+	F.ODBC.Connection!con.Execute(V.Local.sSQL)
+	
+	'At this point, only one record exists for each unique part, w list of WOs and SNs, w correct total qty and ext price. Description (containing WOs) and list of SNs are contained in the custom table (to allow for potentially long lists)
+	
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.CallSub(ErrorMsg, CurrentSub, V.Ambient.CurrentSubroutine)
+F.Intrinsic.Control.EndTry
+Program.Sub.consolidate_work_orders.End
+
+Program.Sub.Comments.Start
+${$5$}$3.0.0.0$}$1
+${$6$}$bmedina$}$20220519150450494$}$kOipCrsyLBVj2KoSwkcdK23ChxGVcBlEn4MVhwcaD/b3tyWdRHDzuZN+O4o2j/1H8cdRhZtX/Mc=
+Program.Sub.Comments.End
